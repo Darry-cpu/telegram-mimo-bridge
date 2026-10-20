@@ -410,6 +410,80 @@ async function handleMessage(cfg, map, update) {
   }
 }
 
+// ---------- 自愈与看护 ----------
+const HEARTBEAT_PATH = path.join(__dirname, "heartbeat.txt");
+const LOCK_PATH = path.join(__dirname, "bridge.lock");
+let consecutivePollFailures = 0;
+const MAX_POLL_FAILURES = 20; // 约 3 分钟一直连不上 Telegram 就交回看护程序重启
+
+function acquireLock() {
+  const existing = loadJson(LOCK_PATH);
+  if (existing && existing.pid) {
+    try {
+      process.kill(existing.pid, 0); // 进程还活着
+      return false;
+    } catch {
+      // 进程已不在，可以接管
+    }
+  }
+  try {
+    fs.writeFileSync(LOCK_PATH, JSON.stringify({ pid: process.pid, at: Date.now() }), "utf8");
+  } catch {}
+  return true;
+}
+
+function releaseLock() {
+  try {
+    const cur = loadJson(LOCK_PATH);
+    if (cur && cur.pid === process.pid) fs.rmSync(LOCK_PATH, { force: true });
+  } catch {}
+}
+
+function heartbeat(note) {
+  try {
+    fs.writeFileSync(HEARTBEAT_PATH, `${Date.now()}\n${note || ""}\n`, "utf8");
+  } catch {}
+}
+
+process.on("uncaughtException", (e) => {
+  log("未捕获异常（不退出）: " + (e && e.stack ? e.stack : e));
+});
+process.on("unhandledRejection", (e) => {
+  log("未处理的 Promise 拒绝（不退出）: " + (e && e.stack ? e.stack : e));
+});
+
+process.on("SIGINT", () => {
+  log("收到 Ctrl+C，正常退出");
+  releaseLock();
+  process.exit(0);
+});
+
+process.on("exit", () => {
+  releaseLock();
+});
+
+async function waitForMiMo(cfg, maxMinutes = 30) {
+  const deadline = Date.now() + maxMinutes * 60 * 1000;
+  let lastLog = 0;
+  for (;;) {
+    try {
+      const h = await deskHealth(cfg);
+      log(`MiMo OK: engine=${h.engine} app=${h.app}`);
+      return true;
+    } catch (e) {
+      if (Date.now() > deadline) {
+        log("等 MiMo 超时，退出交给看护程序重启");
+        return false;
+      }
+      if (Date.now() - lastLog > 60000) {
+        lastLog = Date.now();
+        log("MiMo 还没就绪，1 分钟后重试…");
+      }
+      await sleep(60000);
+    }
+  }
+}
+
 async function main() {
   const cfg = loadConfig();
   const map = loadSessionMap();
@@ -417,18 +491,30 @@ async function main() {
     fs.mkdirSync(cfg.work_dir, { recursive: true });
   } catch {}
 
-  log("检查 MiMo Desktop…");
-  try {
-    const h = await deskHealth(cfg);
-    log(`MiMo OK: engine=${h.engine} app=${h.app}`);
-  } catch (e) {
-    console.error("连不上 MiMo Desktop：", e.message);
-    console.error("请先打开 MiMo Desktop，等它加载完再运行本程序。");
-    process.exit(1);
+  if (!acquireLock()) {
+    log("已经有一个桥在运行了，本进程退出（避免两个实例抢消息）");
+    process.exit(5);
   }
 
+  log("检查 MiMo Desktop…");
+  const ready = await waitForMiMo(cfg);
+  if (!ready) process.exit(2);
+
   log("向 Telegram 报到…");
-  const me = await tgApi(cfg, "getMe", {});
+  let me = null;
+  for (let i = 0; i < 60; i++) {
+    try {
+      me = await tgApi(cfg, "getMe", {});
+      break;
+    } catch (e) {
+      if (i === 0) log("Telegram 暂时连不上（检查代理），持续重试…");
+      await sleep(10000);
+    }
+  }
+  if (!me) {
+    log("连不上 Telegram，退出交给看护程序重启");
+    process.exit(3);
+  }
   log(`机器人：@${me.username}`);
 
   // 清掉旧的 webhook，改用长轮询
@@ -437,6 +523,7 @@ async function main() {
   } catch {}
 
   let offset = 0;
+  heartbeat("started");
   log("开始收消息（Ctrl+C 退出）…");
   for (;;) {
     try {
@@ -445,6 +532,9 @@ async function main() {
         timeout: 30,
         allowed_updates: ["message"],
       });
+      consecutivePollFailures = 0;
+      heartbeat("polling");
+
       for (const u of updates) {
         offset = u.update_id + 1;
         // 串行处理，避免 MiMo 会话打架
@@ -453,10 +543,19 @@ async function main() {
         } catch (e) {
           log("handleMessage 错误: " + (e.stack || e.message));
         }
+        heartbeat("handled");
       }
     } catch (e) {
-      log("轮询出错（8 秒后重试）: " + e.message);
-      await sleep(8000);
+      consecutivePollFailures++;
+      const wait = Math.min(60000, 5000 * Math.min(consecutivePollFailures, 12));
+      log(
+        `轮询出错（第 ${consecutivePollFailures} 次，${Math.round(wait / 1000)} 秒后重试）: ${e.message}`
+      );
+      if (consecutivePollFailures >= MAX_POLL_FAILURES) {
+        log("连续失败太多次，退出交给看护程序重启");
+        process.exit(4);
+      }
+      await sleep(wait);
     }
   }
 }

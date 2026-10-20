@@ -1,6 +1,10 @@
 config.json
 session-map.json
 bridge.log
+watchdog.log
+heartbeat.txt
+bridge.lock
+watchdog.lock
 work/
 node_modules/
 .DS_Store

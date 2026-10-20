@@ -78,6 +78,48 @@ node bridge.js
 
 在 MiMo Desktop 侧边栏点开对应会话，可以看到完整聊天记录。
 
+## 稳定性：断线自动恢复
+
+桥掉了不用管，程序会自己想办法。
+
+**内建自愈（`bridge.js`）**
+
+- 单个错误不会让进程崩掉（捕获未处理异常）
+- MiMo Desktop 还没启动时，最多等 30 分钟，期间每分钟重试一次，不再直接退出
+- Telegram 连不上时按 5s→60s 逐步延长重试；连续失败约 3 分钟就主动退出，交给看护程序重启
+- 用 `bridge.lock` 保证同一时间只有一个实例（Telegram 长轮询不允许两个实例抢同一条消息通道）
+- 定期写 `heartbeat.txt` 心跳，供看护程序判断是否卡死
+
+**看护进程（`watchdog.ps1`）**
+
+每 60 秒检查一次：
+
+- 桥不在 → 立刻拉起
+- 发现多个实例 → 全部清掉重开一个（解决 `Conflict: terminated by other getUpdates request`）
+- 心跳超过 10 分钟没更新 → 判定卡死，重启
+
+启动看护（任选其一）：
+
+```bat
+:: 有窗口，方便看输出
+watchdog.bat
+```
+
+```bat
+:: 全静默，适合后台常驻
+wscript start-watchdog.vbs
+```
+
+**开机自启**
+
+把 `start-watchdog.vbs` 的快捷方式放进启动文件夹：
+
+```
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
+```
+
+（按 `Win+R` 输入 `shell:startup` 可直接打开该文件夹）
+
 ## 工作原理
 
 ```
@@ -96,9 +138,13 @@ Telegram  --长轮询-->  bridge.js  --本机 HTTP-->  MiMo Desktop (desktop-api
 |------|------|
 | `bridge.js` | 主程序 |
 | `config.example.json` | 配置模板（复制为 `config.json`） |
-| `start.bat` | Windows 一键启动 |
+| `start.bat` | Windows 一键启动（单次运行） |
+| `watchdog.ps1` | 看护程序（掉线/卡死自动重启） |
+| `watchdog.bat` | 带窗口启动看护 |
+| `start-watchdog.vbs` | 静默启动看护（开机自启用它） |
 | `session-map.json` | 聊天 ↔ 会话映射（自动生成） |
-| `bridge.log` | 运行日志 |
+| `bridge.log` | 桥运行日志 |
+| `watchdog.log` | 看护日志 |
 
 ## 安全提醒
 
