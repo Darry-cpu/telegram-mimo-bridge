@@ -6,6 +6,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $logPath = Join-Path $root "watchdog.log"
 $heartbeatPath = Join-Path $root "heartbeat.txt"
 $bridgePath = Join-Path $root "bridge.js"
+$bridgeLogPath = Join-Path $root "bridge.log"
 
 # Only one watchdog may run (named mutex is atomic, unlike a lock file).
 $createdNew = $false
@@ -66,6 +67,14 @@ function Get-HeartbeatAgeMinutes {
     return [math]::Round($age.TotalMinutes, 1)
 }
 
+# A bridge that is merely failing to reach the network keeps writing to its log,
+# so log freshness tells "busy retrying" apart from "really stuck".
+function Get-LogAgeMinutes {
+    if (-not (Test-Path $bridgeLogPath)) { return 999 }
+    $age = (Get-Date) - (Get-Item $bridgeLogPath).LastWriteTime
+    return [math]::Round($age.TotalMinutes, 1)
+}
+
 function Stop-AllBridges {
     foreach ($p in (Get-BridgeProcesses)) {
         WLog ("stopping pid=" + $p.ProcessId + " name=" + $p.Name)
@@ -78,14 +87,38 @@ function Start-Bridge {
     Start-Process -FilePath $node -ArgumentList ('"' + $bridgePath + '"') -WorkingDirectory $root -WindowStyle Hidden
 }
 
+# Restart pacing: repeated restarts back off 1 -> 10 minutes. A bridge that stays
+# healthy for 5 minutes clears the penaltly, so a one-off crash still recovers fast.
+$restartStreak = 0
+$nextRestartAllowedAt = Get-Date
+
+function Register-Restart {
+    $script:restartStreak = $script:restartStreak + 1
+    $waitMinutes = [math]::Min(10, [math]::Pow(2, $script:restartStreak - 1))
+    $script:nextRestartAllowedAt = (Get-Date).AddMinutes($waitMinutes)
+    WLog ("restart streak=" + $script:restartStreak + ", next restart allowed after " + $waitMinutes + " min")
+}
+
+function Test-RestartAllowed {
+    return ((Get-Date) -ge $script:nextRestartAllowedAt)
+}
+
+$healthySince = $null
+
 while ($true) {
     $procs = @(Get-BridgeProcesses)
 
     if ($procs.Count -eq 0) {
-        WLog "bridge not running, starting..."
-        Start-Bridge
-        Start-Sleep -Seconds 20
-        if (@(Get-BridgeProcesses).Count -gt 0) { WLog "bridge started" } else { WLog "start failed, retry in 60s" }
+        if (Test-RestartAllowed) {
+            WLog "bridge not running, starting..."
+            Start-Bridge
+            Start-Sleep -Seconds 20
+            if (@(Get-BridgeProcesses).Count -gt 0) { WLog "bridge started" } else { WLog "start failed, will retry" ; Register-Restart }
+        }
+        else {
+            WLog "bridge down but restart is backing off, waiting"
+        }
+        $healthySince = $null
     }
     elseif ($procs.Count -gt 1) {
         # Duplicated instances make Telegram reject both ("Conflict: terminated
@@ -94,14 +127,40 @@ while ($true) {
         Stop-AllBridges
         Start-Bridge
         Start-Sleep -Seconds 20
+        $healthySince = $null
     }
     else {
-        $age = Get-HeartbeatAgeMinutes
-        if ($age -gt 10) {
-            WLog ("heartbeat stale (" + $age + " min), restarting bridge")
-            Stop-AllBridges
-            Start-Bridge
-            Start-Sleep -Seconds 20
+        $heartbeatAge = Get-HeartbeatAgeMinutes
+        $logAge = Get-LogAgeMinutes
+
+        if ($heartbeatAge -le 3) {
+            # Healthy right now.
+            if ($null -eq $healthySince) { $healthySince = Get-Date }
+            elseif (((Get-Date) - $healthySince).TotalMinutes -ge 5 -and $restartStreak -gt 0) {
+                WLog ("bridge healthy for 5+ min, clearing restart streak (" + $restartStreak + ")")
+                $restartStreak = 0
+                $nextRestartAllowedAt = Get-Date
+            }
+        }
+        elseif ($heartbeatAge -gt 15 -and $logAge -gt 15) {
+            # No heartbeat AND no log activity: the process is genuinely hung.
+            if (Test-RestartAllowed) {
+                WLog ("bridge hung (heartbeat " + $heartbeatAge + " min, log " + $logAge + " min), restarting")
+                Stop-AllBridges
+                Start-Bridge
+                Start-Sleep -Seconds 20
+                Register-Restart
+            }
+            else {
+                WLog ("bridge looks hung but restart is backing off; next attempt later")
+            }
+            $healthySince = $null
+        }
+        elseif ($heartbeatAge -gt 15) {
+            # Still writing logs: it is retrying a network/proxy problem. Killing it
+            # would not help and would restart the retry budget, so leave it alone.
+            WLog ("heartbeat " + $heartbeatAge + " min old but bridge is still active (log " + $logAge + " min) - network trouble, not restarting")
+            $healthySince = $null
         }
     }
 

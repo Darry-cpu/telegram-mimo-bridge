@@ -3,8 +3,8 @@
   "allowed_user_ids": [],
   "model": "xiaomi/mimo-v2.6-flash",
   "session_id": "",
-  "work_dir": "",
   "desktop_api_json": "",
   "proxy": "http://127.0.0.1:7890",
-  "turn_timeout_min": 30
+  "turn_timeout_min": 30,
+  "deferred_timeout_min": 180
 }
