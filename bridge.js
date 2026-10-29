@@ -178,7 +178,20 @@ function extractAssistantText(msg) {
   return texts.join("\n").trim();
 }
 
-/** 把一轮任务交给 MiMo，返回本轮开始前的基线（用于识别本轮回复）。 */
+// 手机端看不到电脑上的确认框，所以把"自主决策"要求放在每条消息前面，
+// 让 MiMo 尽量不弹确认/选择题，避免任务卡死在等人点击。
+const REMOTE_HINT =
+  "【远程遥控场景】我此刻在用手机通过 Telegram 遥控你，看不到也点不了电脑上的确认框和选择卡片。" +
+  "遇到需要我确认、需要我二选一、需要审批的操作时，请不要停下来问我，" +
+  "请自己选择最合理、最保守可行的方案直接做完，最后在回复里用一小段说明你做了哪些假设和选择。";
+
+function buildPrompt(cfg, text) {
+  const parts = [];
+  if (cfg.system_hint) parts.push(String(cfg.system_hint).trim());
+  parts.push(REMOTE_HINT);
+  parts.push(text);
+  return parts.filter(Boolean).join("\n\n");
+}
 async function startTurn(cfg, sessionId, message) {
   const dir = await getSessionDir(cfg, sessionId);
   const turnBody = {
@@ -213,6 +226,8 @@ async function pollTurn(cfg, sessionId, baseline, opts = {}) {
   const onProgress = opts.onProgress;
   let lastProgressAt = 0;
   let lastText = "";
+  let stuckNotified = false;
+  const stuckAfterMs = opts.stuckAfterMs ?? 3 * 60 * 1000;
 
   while (Date.now() < deadline) {
     await sleep(opts.intervalMs || 2000);
@@ -253,7 +268,6 @@ async function pollTurn(cfg, sessionId, baseline, opts = {}) {
 
     if (onProgress && Date.now() - lastProgressAt > progressEveryMs) {
       lastProgressAt = Date.now();
-      // 只看本轮开始后产生的消息，避免把上一轮的旧文字当成本轮进度
       let partial = "";
       for (const m of msgs) {
         if (m?.info?.role !== "assistant") continue;
@@ -261,6 +275,17 @@ async function pollTurn(cfg, sessionId, baseline, opts = {}) {
         if (startedAt && created && created < startedAt) continue;
         const t = extractAssistantText(m);
         if (t) partial = t;
+      }
+
+      // 三分钟没有任何输出 → 很可能在等电脑上的确认框，提醒一次
+      if (
+        opts.onStuck &&
+        !stuckNotified &&
+        !partial &&
+        Date.now() - (startedAt || deadline) > stuckAfterMs
+      ) {
+        stuckNotified = true;
+        opts.onStuck();
       }
       if (partial && partial !== lastText) {
         lastText = partial;
@@ -556,13 +581,21 @@ async function handleMessage(cfg, map, update) {
   };
 
   try {
-    const before = await startTurn(cfg, sessionId, text);
+    const before = await startTurn(cfg, sessionId, buildPrompt(cfg, text));
     onProgress("已交给 MiMo，正在处理…");
 
     const fgMinutes = cfg.turn_timeout_min || 30;
     const r = await pollTurn(cfg, sessionId, before, {
       deadline: Date.now() + fgMinutes * 60 * 1000,
       onProgress,
+      onStuck: () =>
+        tgSendMessage(
+          cfg,
+          chatId,
+          "⏳ 这轮已经 3 分钟没有任何输出了。\n" +
+            "很可能是电脑上的 MiMo 弹了确认框或让你选一个方案——这类提示手机端暂时点不了，需要你在电脑上点一下。\n" +
+            "（点完后这里会继续收到结果）"
+        ).catch(() => {}),
     });
 
     if (r.done) {
@@ -769,4 +802,6 @@ module.exports = {
   tgEditMessage,
   takeSendSlot,
   splitMessage,
+  buildPrompt,
 };
+
