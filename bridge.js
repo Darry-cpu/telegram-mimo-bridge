@@ -180,6 +180,7 @@ function extractAssistantText(msg) {
 
 // 手机端看不到电脑上的确认框，所以把"自主决策"要求放在每条消息前面，
 // 让 MiMo 尽量不弹确认/选择题，避免任务卡死在等人点击。
+const HINT_MARK = "【远程遥控场景】";
 const REMOTE_HINT =
   "【远程遥控场景】我此刻在用手机通过 Telegram 遥控你，看不到也点不了电脑上的确认框和选择卡片。" +
   "遇到需要我确认、需要我二选一、需要审批的操作时，请不要停下来问我，" +
@@ -192,28 +193,45 @@ function buildPrompt(cfg, text) {
   parts.push(text);
   return parts.filter(Boolean).join("\n\n");
 }
+
+/** 这段提示是否已经在这个会话里出现过（出现过就不再重复加）。 */
+function hintAlreadySent(msgs) {
+  if (!Array.isArray(msgs)) return false;
+  for (const m of msgs) {
+    if (m?.info?.role !== "user") continue;
+    for (const p of m.parts || []) {
+      if (p?.type === "text" && typeof p.text === "string" && p.text.includes(HINT_MARK)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 async function startTurn(cfg, sessionId, message) {
   const dir = await getSessionDir(cfg, sessionId);
-  const turnBody = {
-    message,
-    model: cfg.model || "xiaomi/mimo-v2.6-flash",
-  };
-  if (dir) turnBody.dir = dir;
 
   let beforeCompleted = 0;
+  let withHint = true;
   try {
     const msgs = await deskMessages(cfg, sessionId, dir);
     for (const m of msgs) {
       const t = m?.info?.time?.completed || 0;
       if (t > beforeCompleted) beforeCompleted = t;
     }
+    withHint = !hintAlreadySent(msgs);
   } catch {
     // 会话可能还很新，忽略
   }
 
+  const turnBody = {
+    message: withHint ? buildPrompt(cfg, message) : message,
+    model: cfg.model || "xiaomi/mimo-v2.6-flash",
+  };
+  if (dir) turnBody.dir = dir;
+
   const startedAt = Date.now();
   await deskSendTurn(cfg, sessionId, turnBody);
-  return { beforeCompleted, startedAt, dir };
+  return { beforeCompleted, startedAt, dir, withHint };
 }
 
 /** 轮询本轮进展，直到完成或到期限。返回 { done, text }。 */
@@ -581,7 +599,7 @@ async function handleMessage(cfg, map, update) {
   };
 
   try {
-    const before = await startTurn(cfg, sessionId, buildPrompt(cfg, text));
+    const before = await startTurn(cfg, sessionId, text);
     onProgress("已交给 MiMo，正在处理…");
 
     const fgMinutes = cfg.turn_timeout_min || 30;
