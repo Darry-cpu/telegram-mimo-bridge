@@ -21,6 +21,26 @@ function defaultDesktopApiJson() {
   return path.join(appData, "Xiaomi MiMo", "desktop-api.json");
 }
 
+// 本地回环地址永远不该走代理：MiMo Desktop 的本机接口一旦被代理劫持，
+// 会变成偶发的连接失败（尤其是在代理切节点的时候）。
+// Telegram 的请求仍然按 HTTPS_PROXY 走代理。
+(function ensureLocalBypassesProxy() {
+  if (!process.env.NODE_USE_ENV_PROXY) process.env.NODE_USE_ENV_PROXY = "1";
+  const required = ["localhost", "127.0.0.1", "::1"];
+  const current = (process.env.NO_PROXY || process.env.no_proxy || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const merged = Array.from(new Set([...current, ...required]));
+  process.env.NO_PROXY = merged.join(",");
+  process.env.no_proxy = process.env.NO_PROXY;
+})();
+
+// 每个请求都有独立超时：长轮询卡住时不会拖住发送，反之亦然。
+const TIMEOUT_DESK_MS = 15000;
+const TIMEOUT_TG_SEND_MS = 20000;
+const TIMEOUT_TG_POLL_MS = 45000; // 长轮询 30 秒 + 余量
+
 // ---------- 基础工具 ----------
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -83,6 +103,7 @@ async function deskFetch(cfg, pathname, options = {}) {
   const url = `http://127.0.0.1:${port}${pathname}`;
   const res = await fetch(url, {
     ...options,
+    signal: AbortSignal.timeout(TIMEOUT_DESK_MS),
     headers: {
       Authorization: `Bearer ${token}`,
       ...(options.headers || {}),
@@ -220,6 +241,10 @@ async function pollTurn(cfg, sessionId, baseline, opts = {}) {
         latest.info.finish === "length" ||
         latest.info.finish === "error")
     ) {
+      const completedAt = latestCompleted;
+      const lag = completedAt ? Date.now() - completedAt : 0;
+      const sinceSubmit = Math.round((Date.now() - (startedAt || Date.now())) / 1000);
+      log(`本轮完成：提交后 ${sinceSubmit} 秒检测到（MiMo 落盘后 ${lag} ms 发现）`);
       return {
         done: true,
         text: extractAssistantText(latest) || "(这轮没有文字回复)",
@@ -364,10 +389,13 @@ async function takeSendSlot(chatId) {
 
 async function tgApi(cfg, method, params, attempts = 0) {
   const url = `${tgBase(cfg)}/${method}`;
+  const timeoutMs =
+    method === "getUpdates" ? TIMEOUT_TG_POLL_MS : TIMEOUT_TG_SEND_MS;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(params || {}),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   const data = await res.json().catch(() => ({}));
   if (data.ok) return data.result;
@@ -541,7 +569,12 @@ async function handleMessage(cfg, map, update) {
       if (statusMsg) {
         await tgEditMessage(cfg, chatId, statusMsg.message_id, "✅ 完成，正在发送结果…");
       }
+      const sendStart = Date.now();
+      const segments = splitMessage(r.text || "").length;
       await tgSendMessage(cfg, chatId, r.text);
+      log(
+        `结果已发出：${segments} 段，发送耗时 ${Math.round((Date.now() - sendStart) / 1000)} 秒`
+      );
       if (statusMsg) {
         await tgEditMessage(cfg, chatId, statusMsg.message_id, `✅ 完成（会话 ${sessionId}）`);
       }
@@ -647,6 +680,9 @@ async function main() {
   }
 
   log("检查 MiMo Desktop…");
+  log(
+    `代理设置：HTTPS_PROXY=${process.env.HTTPS_PROXY || "(未设置，直连)"} NO_PROXY=${process.env.NO_PROXY}`
+  );
   const ready = await waitForMiMo(cfg);
   if (!ready) process.exit(2);
 
@@ -673,6 +709,8 @@ async function main() {
   } catch {}
 
   let offset = 0;
+  // 任务串行执行，但不阻塞收消息
+  let workChain = Promise.resolve();
   heartbeat("started");
   log("开始收消息（Ctrl+C 退出）…");
   for (;;) {
@@ -687,13 +725,12 @@ async function main() {
 
       for (const u of updates) {
         offset = u.update_id + 1;
-        // 串行处理，避免 MiMo 会话打架
-        try {
-          await handleMessage(cfg, map, u);
-        } catch (e) {
-          log("handleMessage 错误: " + (e.stack || e.message));
-        }
-        heartbeat("handled");
+        // 消息交给串行队列处理：MiMo 任务之间不打架，但收消息的长轮询不再被
+        // 正在跑的任务堵住（以前一轮任务 30 分钟，期间完全收不到新消息）。
+        workChain = workChain
+          .then(() => handleMessage(cfg, map, u))
+          .catch((e) => log("handleMessage 错误: " + (e.stack || e.message)))
+          .then(() => heartbeat("handled"));
       }
     } catch (e) {
       consecutivePollFailures++;
